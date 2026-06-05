@@ -2,10 +2,16 @@ const fs = require("fs/promises");
 const path = require("path");
 const axios = require("axios");
 const mongoose = require("mongoose");
+const QRCode = require("qrcode");
+const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://192.168.1.96:27017/jokersRA";
 const USUARIOS_COLLECTION = process.env.USUARIOS_COLLECTION || "usuarios";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 5);
+const COMMAND = "/tarefas";
+const REMETENTES_LIBERADOS = new Set([
+    "162247355711521@lid"
+]);
 const SUBSCRIPTION_KEY =
     process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
 
@@ -176,9 +182,8 @@ function detalhesErro(err) {
     };
 }
 
-async function processarUsuario(usuario, tamanhoMaiorNome) {
+async function processarUsuario(usuario) {
     const identificador = usuario.nome || usuario.user;
-    const nomeAlinhado = identificador.padEnd(tamanhoMaiorNome, " ");
 
     try {
         const token = await fazerLogin(usuario.user, usuario.senha);
@@ -192,10 +197,9 @@ async function processarUsuario(usuario, tamanhoMaiorNome) {
         const pendentesResumo = resumirTarefas(pendentes);
         const expiradasResumo = resumirTarefas(expiradas);
 
-        console.log(`${nomeAlinhado} | Pendentes: ${pendentes.length} | Expiradas: ${expiradas.length}\n`);
-
         return {
             ok: true,
+            linha: `${identificador}\nPENDENTES: ${pendentes.length}\nEXPIRADAS: ${expiradas.length}`,
             usuario: {
                 id: usuario._id,
                 nome: usuario.nome,
@@ -217,13 +221,14 @@ async function processarUsuario(usuario, tamanhoMaiorNome) {
         const erro = detalhesErro(err);
 
         console.error(
-            `ERRO: ${nomeAlinhado}`,
+            `ERRO: ${identificador}`,
             JSON.stringify(erro)
         );
         console.error("");
 
         return {
             ok: false,
+            linha: `${identificador}\nPENDENTES: -\nEXPIRADAS: -\nERRO`,
             usuario: {
                 id: usuario._id,
                 nome: usuario.nome,
@@ -266,83 +271,204 @@ async function salvarResultado(resultados) {
     return filePath;
 }
 
-async function main() {
-    try {
-        if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1) {
-            throw new Error("CONCURRENCY precisa ser um numero inteiro maior que zero.");
+async function buscarUsuarios() {
+    const usuarios = await Usuario.find(
+        {
+            user: { $exists: true, $ne: "" },
+            senha: { $exists: true, $ne: "" }
+        },
+        {
+            nome: 1,
+            email: 1,
+            user: 1,
+            senha: 1
         }
+    ).lean();
 
-        await mongoose.connect(MONGO_URI);
-
-        const totalNaCollection = await Usuario.collection.countDocuments();
-        const usuarios = await Usuario.find(
-            {
-                user: { $exists: true, $ne: "" },
-                senha: { $exists: true, $ne: "" }
-            },
-            {
-                nome: 1,
-                email: 1,
-                user: 1,
-                senha: 1
-            }
-        ).lean();
-
-        console.log(`Mongo DB: ${mongoose.connection.db.databaseName}`);
-        console.log(`Collection: ${USUARIOS_COLLECTION}`);
-        console.log(`Total na collection: ${totalNaCollection}`);
-        console.log(`Usuarios com user e senha: ${usuarios.length}`);
-        console.log(`Concorrencia: ${CONCURRENCY}`);
-
-        const tamanhoMaiorNome = usuarios.reduce((maior, usuario) => {
-            const identificador = usuario.nome || usuario.user;
-            return Math.max(maior, identificador.length);
-        }, 0);
-
-        const resultados = await executarComConcorrencia(
-            usuarios,
-            CONCURRENCY,
-            (usuario) => processarUsuario(usuario, tamanhoMaiorNome)
-        );
-
-        const resumo = resultados.reduce(
-            (acc, item) => {
-                if (!item.ok) {
-                    acc.erros += 1;
-                    return acc;
-                }
-
-                acc.sucesso += 1;
-                acc.pendentes += item.totais.pendentes;
-                acc.expiradas += item.totais.expiradas;
-                return acc;
-            },
-            {
-                sucesso: 0,
-                erros: 0,
-                pendentes: 0,
-                expiradas: 0
-            }
-        );
-
-        const filePath = await salvarResultado({
-            geradoEm: new Date().toISOString(),
-            resumo,
-            resultados
-        });
-
-        console.log("\n=== RESUMO GERAL ===");
-        console.log(`Usuarios com sucesso: ${resumo.sucesso}`);
-        console.log(`Usuarios com erro: ${resumo.erros}`);
-        console.log(`Pendentes: ${resumo.pendentes}`);
-        console.log(`Expiradas: ${resumo.expiradas}`);
-        console.log(`Arquivo salvo em: ${filePath}`);
-    } catch (err) {
-        console.error("Falha geral:", detalhesErro(err));
-        process.exitCode = 1;
-    } finally {
-        await mongoose.disconnect();
-    }
+    return usuarios.sort((a, b) => {
+        const nomeA = a.nome || a.user;
+        const nomeB = b.nome || b.user;
+        return nomeA.localeCompare(nomeB, "pt-BR", { sensitivity: "base" });
+    });
 }
 
-main();
+function montarMensagem(resultados) {
+    const linhas = resultados.map((item) => item.linha);
+    return `\`\`\`\n${linhas.join("\n\n")}\n\`\`\``;
+}
+
+async function gerarRelatorioTarefas() {
+    const totalNaCollection = await Usuario.collection.countDocuments();
+    const usuarios = await buscarUsuarios();
+
+    console.log(`Mongo DB: ${mongoose.connection.db.databaseName}`);
+    console.log(`Collection: ${USUARIOS_COLLECTION}`);
+    console.log(`Total na collection: ${totalNaCollection}`);
+    console.log(`Usuarios com user e senha: ${usuarios.length}`);
+    console.log(`Concorrencia: ${CONCURRENCY}`);
+
+    const resultados = await executarComConcorrencia(
+        usuarios,
+        CONCURRENCY,
+        (usuario) => processarUsuario(usuario)
+    );
+
+    const resumo = resultados.reduce(
+        (acc, item) => {
+            if (!item.ok) {
+                acc.erros += 1;
+                return acc;
+            }
+
+            acc.sucesso += 1;
+            acc.pendentes += item.totais.pendentes;
+            acc.expiradas += item.totais.expiradas;
+            return acc;
+        },
+        {
+            sucesso: 0,
+            erros: 0,
+            pendentes: 0,
+            expiradas: 0
+        }
+    );
+
+    const filePath = await salvarResultado({
+        geradoEm: new Date().toISOString(),
+        resumo,
+        resultados
+    });
+
+    console.log(`Arquivo salvo em: ${filePath}`);
+
+    return {
+        mensagem: montarMensagem(resultados),
+        resumo,
+        filePath
+    };
+}
+
+function normalizarWhatsappId(id) {
+    if (!id) {
+        return "";
+    }
+
+    return String(id)
+        .split("@")[0]
+        .split(":")[0]
+        .replace(/\D/g, "");
+}
+
+function idsDoParticipante(participante) {
+    return [
+        participante?.id?._serialized,
+        participante?.id?.user,
+        participante?.id?.server ? `${participante.id.user}@${participante.id.server}` : undefined
+    ].filter(Boolean);
+}
+
+function remetenteEhAdmin(chat, message) {
+    if (!chat.isGroup) {
+        return false;
+    }
+
+    const remetente = message.author || message.from;
+    const remetenteNormalizado = normalizarWhatsappId(remetente);
+    const remetenteLiberado = REMETENTES_LIBERADOS.has(remetente);
+    const participante = chat.participants.find((item) =>
+        idsDoParticipante(item).some((id) => {
+            return id === remetente || normalizarWhatsappId(id) === remetenteNormalizado;
+        })
+    );
+
+    console.log(
+        "Comando /tarefas:",
+        JSON.stringify({
+            remetente,
+            remetenteNormalizado,
+            remetenteLiberado,
+            participanteEncontrado: Boolean(participante),
+            isAdmin: Boolean(participante?.isAdmin),
+            isSuperAdmin: Boolean(participante?.isSuperAdmin)
+        })
+    );
+
+    return Boolean(
+        remetenteLiberado ||
+            participante?.isAdmin ||
+            participante?.isSuperAdmin
+    );
+}
+
+async function iniciarWhatsapp() {
+    if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1) {
+        throw new Error("CONCURRENCY precisa ser um numero inteiro maior que zero.");
+    }
+
+    await mongoose.connect(MONGO_URI);
+
+    const client = new Client({
+        authStrategy: new LocalAuth({
+            clientId: "joker-tarefas"
+        }),
+        puppeteer: {
+            args: ["--no-sandbox", "--disable-setuid-sandbox"]
+        }
+    });
+
+    let gerandoRelatorio = false;
+
+    client.on("qr", async (qr) => {
+        const qrTerminal = await QRCode.toString(qr, { type: "terminal", small: true });
+        console.log(qrTerminal);
+        console.log("Escaneie o QR Code acima com o WhatsApp.");
+    });
+
+    client.on("ready", () => {
+        console.log("WhatsApp conectado. Aguardando /tarefas em grupos.");
+    });
+
+    client.on("message", async (message) => {
+        if (message.body.trim().toLowerCase() !== COMMAND) {
+            return;
+        }
+
+        const chat = await message.getChat();
+
+        if (!chat.isGroup) {
+            await message.reply("Esse comando funciona apenas em grupos.");
+            return;
+        }
+
+        if (!remetenteEhAdmin(chat, message)) {
+            await message.reply("Apenas admins do grupo podem usar /tarefas.");
+            return;
+        }
+
+        if (gerandoRelatorio) {
+            await message.reply("Ja estou gerando um relatorio. Aguarde finalizar.");
+            return;
+        }
+
+        gerandoRelatorio = true;
+
+        try {
+            await message.reply("Buscando tarefas...");
+            const { mensagem } = await gerarRelatorioTarefas();
+            await chat.sendMessage(mensagem);
+        } catch (err) {
+            console.error("Falha ao gerar relatorio:", detalhesErro(err));
+            await message.reply("Nao consegui buscar as tarefas agora.");
+        } finally {
+            gerandoRelatorio = false;
+        }
+    });
+
+    await client.initialize();
+}
+
+iniciarWhatsapp().catch(async (err) => {
+    console.error("Falha geral:", detalhesErro(err));
+    await mongoose.disconnect();
+    process.exitCode = 1;
+});
