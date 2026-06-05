@@ -1,0 +1,28 @@
+{
+  "geradoEm": "2026-06-05T03:30:56.381Z",
+  "resumo": {
+    "sucesso": 1,
+    "erros": 0,
+    "pendentes": 0,
+    "expiradas": 0
+  },
+  "resultados": [
+    {
+      "ok": true,
+      "usuario": {
+        "id": "6a12460d79330dd4571d275a",
+        "nome": "HÉLIO AUGUSTO DE OLIVEIRA",
+        "email": "00001105904982SP@al.educacao.sp.gov.br",
+        "user": "00001105904982SP"
+      },
+      "nick": "helioaugust105904982-sp",
+      "salas": 4,
+      "pendentes": [],
+      "expiradas": [],
+      "totais": {
+        "pendentes": 0,
+        "expiradas": 0
+      }
+    }
+  ]
+}
