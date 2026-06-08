@@ -1,0 +1,26 @@
+services:
+  joker-tarefas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    shm_size: "1gb"
+    environment:
+      NODE_ENV: production
+      MONGO_URI: ${MONGO_URI}
+      USUARIOS_COLLECTION: ${USUARIOS_COLLECTION:-usuarios}
+      CONCURRENCY: ${CONCURRENCY:-5}
+      SUBSCRIPTION_KEY: ${SUBSCRIPTION_KEY}
+      REMETENTES_LIBERADOS: ${REMETENTES_LIBERADOS:-162247355711521@lid}
+      WHATSAPP_AUTH_DIR: /app/.wwebjs_auth
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    volumes:
+      - joker_whatsapp_auth:/app/.wwebjs_auth
+      - joker_whatsapp_cache:/app/.wwebjs_cache
+      - joker_output:/app/output
+
+volumes:
+  joker_whatsapp_auth:
+  joker_whatsapp_cache:
+  joker_output:

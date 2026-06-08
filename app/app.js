@@ -10,11 +10,14 @@ const USUARIOS_COLLECTION = process.env.USUARIOS_COLLECTION || "usuarios";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 5);
 const TAREFAS_COMMAND = "/tarefas";
 const STATUS_COMMAND = "/status";
-const REMETENTES_LIBERADOS = new Set([
-    "162247355711521@lid",
-    "157058481537162@lid",
-    "139109729312833@lid"
-]);
+const WHATSAPP_AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || ".wwebjs_auth";
+const REMETENTES_LIBERADOS = new Set(
+    (process.env.REMETENTES_LIBERADOS ||
+        "162247355711521@lid,157058481537162@lid,139109729312833@lid")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+);
 const SUBSCRIPTION_KEY =
     process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
 
@@ -433,7 +436,8 @@ async function iniciarWhatsapp() {
 
     const client = new Client({
         authStrategy: new LocalAuth({
-            clientId: "joker-tarefas"
+            clientId: "joker-tarefas",
+            dataPath: WHATSAPP_AUTH_DIR
         }),
         puppeteer: {
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
