@@ -1,0 +1,16 @@
+services:
+  joker-tarefas:
+    build:
+      context: .
+    container_name: joker-tarefas
+    restart: unless-stopped
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://192.168.1.96:27017/jokersRA}
+      USUARIOS_COLLECTION: ${USUARIOS_COLLECTION:-usuarios}
+      CONCURRENCY: ${CONCURRENCY:-5}
+      SUBSCRIPTION_KEY: ${SUBSCRIPTION_KEY:-d701a2043aa24d7ebb37e9adf60d043b}
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    volumes:
+      - ./.wwebjs_auth:/app/.wwebjs_auth
+      - ./.wwebjs_cache:/app/.wwebjs_cache
+      - ./output:/app/output

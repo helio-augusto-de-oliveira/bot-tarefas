@@ -8,9 +8,12 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const MONGO_URI = process.env.MONGO_URI || "mongodb://192.168.1.96:27017/jokersRA";
 const USUARIOS_COLLECTION = process.env.USUARIOS_COLLECTION || "usuarios";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 5);
-const COMMAND = "/tarefas";
+const TAREFAS_COMMAND = "/tarefas";
+const STATUS_COMMAND = "/status";
 const REMETENTES_LIBERADOS = new Set([
-    "162247355711521@lid"
+    "162247355711521@lid",
+    "157058481537162@lid",
+    "139109729312833@lid"
 ]);
 const SUBSCRIPTION_KEY =
     process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
@@ -367,7 +370,7 @@ function idsDoParticipante(participante) {
     ].filter(Boolean);
 }
 
-function remetenteEhAdmin(chat, message) {
+function remetentePodeUsarComando(chat, message, comando) {
     if (!chat.isGroup) {
         return false;
     }
@@ -382,7 +385,7 @@ function remetenteEhAdmin(chat, message) {
     );
 
     console.log(
-        "Comando /tarefas:",
+        `Comando ${comando}:`,
         JSON.stringify({
             remetente,
             remetenteNormalizado,
@@ -400,6 +403,27 @@ function remetenteEhAdmin(chat, message) {
     );
 }
 
+async function gerarStatusBot(gerandoRelatorio) {
+    const totalNaCollection = await Usuario.collection.countDocuments();
+    const usuariosComCredenciais = await Usuario.countDocuments({
+        user: { $exists: true, $ne: "" },
+        senha: { $exists: true, $ne: "" }
+    });
+
+    return [
+        "STATUS DO BOT",
+        "",
+        "WHATSAPP: conectado",
+        `MONGO: ${mongoose.connection.readyState === 1 ? "conectado" : "desconectado"}`,
+        `DB: ${mongoose.connection.db?.databaseName || "-"}`,
+        `COLLECTION: ${USUARIOS_COLLECTION}`,
+        `TOTAL NA COLLECTION: ${totalNaCollection}`,
+        `USUARIOS COM LOGIN: ${usuariosComCredenciais}`,
+        `CONCORRENCIA: ${CONCURRENCY}`,
+        `RELATORIO: ${gerandoRelatorio ? "gerando agora" : "livre"}`
+    ].join("\n");
+}
+
 async function iniciarWhatsapp() {
     if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1) {
         throw new Error("CONCURRENCY precisa ser um numero inteiro maior que zero.");
@@ -412,6 +436,7 @@ async function iniciarWhatsapp() {
             clientId: "joker-tarefas"
         }),
         puppeteer: {
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
             args: ["--no-sandbox", "--disable-setuid-sandbox"]
         }
     });
@@ -425,11 +450,13 @@ async function iniciarWhatsapp() {
     });
 
     client.on("ready", () => {
-        console.log("WhatsApp conectado. Aguardando /tarefas em grupos.");
+        console.log("WhatsApp conectado. Aguardando /tarefas e /status em grupos.");
     });
 
     client.on("message", async (message) => {
-        if (message.body.trim().toLowerCase() !== COMMAND) {
+        const comando = message.body.trim().toLowerCase();
+
+        if (![TAREFAS_COMMAND, STATUS_COMMAND].includes(comando)) {
             return;
         }
 
@@ -440,8 +467,20 @@ async function iniciarWhatsapp() {
             return;
         }
 
-        if (!remetenteEhAdmin(chat, message)) {
-            await message.reply("Apenas admins do grupo podem usar /tarefas.");
+        if (!remetentePodeUsarComando(chat, message, comando)) {
+            await message.reply(`Apenas admins do grupo podem usar ${comando}.`);
+            return;
+        }
+
+        if (comando === STATUS_COMMAND) {
+            try {
+                const status = await gerarStatusBot(gerandoRelatorio);
+                await chat.sendMessage(`\`\`\`\n${status}\n\`\`\``);
+            } catch (err) {
+                console.error("Falha ao gerar status:", detalhesErro(err));
+                await message.reply("Nao consegui buscar o status agora.");
+            }
+
             return;
         }
 
