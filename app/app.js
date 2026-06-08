@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const QRCode = require("qrcode");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 
+
 const MONGO_URI = process.env.MONGO_URI || "mongodb://192.168.1.96:27017/jokersRA";
 const USUARIOS_COLLECTION = process.env.USUARIOS_COLLECTION || "usuarios";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 5);
