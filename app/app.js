@@ -497,7 +497,7 @@ async function iniciarWhatsapp() {
         gerandoRelatorio = true;
 
         try {
-            await message.reply("Buscando tarefas...");
+            await message.reply("Buscando tarefas");
             const { mensagem } = await gerarRelatorioTarefas();
             await chat.sendMessage(mensagem);
         } catch (err) {
