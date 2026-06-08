@@ -1,6 +1,7 @@
 const fs = require("fs/promises");
 const path = require("path");
 const axios = require("axios");
+const https = require("https");
 const mongoose = require("mongoose");
 const QRCode = require("qrcode");
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -23,7 +24,16 @@ const SUBSCRIPTION_KEY =
     process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
 
 const api = axios.create({
-    timeout: 30000
+    timeout: 30000,
+    httpsAgent: new https.Agent({
+        keepAlive: true,
+        maxSockets: 5
+    }),
+    headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Connection: "keep-alive"
+    }
 });
 
 const UsuarioSchema = new mongoose.Schema({
@@ -497,7 +507,7 @@ async function iniciarWhatsapp() {
         gerandoRelatorio = true;
 
         try {
-            await message.reply("Buscando tarefas");
+            await message.reply("Buscando tarefas....");
             const { mensagem } = await gerarRelatorioTarefas();
             await chat.sendMessage(mensagem);
         } catch (err) {

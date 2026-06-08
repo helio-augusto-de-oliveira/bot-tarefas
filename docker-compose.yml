@@ -2,6 +2,7 @@ services:
   joker-tarefas:
     build:
       context: .
+      dockerfile: Dockerfile
     container_name: joker-tarefas
     restart: unless-stopped
     environment:
