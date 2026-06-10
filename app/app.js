@@ -16,24 +16,28 @@ const USUARIOS_COLLECTION =
     process.env.USUARIOS_COLLECTION || "usuarios";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 2);
 const TAREFAS_COMMAND = "/tarefas";
-const STATUS_COMMAND = "/status";
+const STATUS_COMMAND  = "/status";
+const ADMIN_COMMAND   = "/admin";
 const WHATSAPP_AUTH_DIR =
     process.env.WHATSAPP_AUTH_DIR || "../.wwebjs_auth";
-const REMETENTES_LIBERADOS = new Set(
-    (
-        process.env.REMETENTES_LIBERADOS ||
-        "162247355711521@lid,157058481537162@lid,139109729312833@lid"
-    )
+const SUBSCRIPTION_KEY =
+    process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
+
+// Dono do bot — único que pode gerenciar admins
+// Pode ser sobrescrito via env para não ficar hardcoded
+const DONO_ID = process.env.DONO_ID || "162247355711521@lid";
+
+// IDs liberados por env (retrocompatibilidade) — tratados como admins fixos
+const LIBERADOS_ENV = new Set(
+    (process.env.REMETENTES_LIBERADOS || DONO_ID)
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean)
 );
-const SUBSCRIPTION_KEY =
-    process.env.SUBSCRIPTION_KEY || "d701a2043aa24d7ebb37e9adf60d043b";
 
 // Quanto tempo antes do vencimento o token é renovado proativamente (ms)
-const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 min
-// TTL do cache de salas: 30 min (sala muda muito raramente)
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+// TTL do cache de salas: 30 min
 const SALAS_CACHE_TTL_MS = 30 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -52,7 +56,6 @@ const api = axios.create({
 
 // ---------------------------------------------------------------------------
 // Retry com backoff exponencial
-// Trata: 429, 5xx e erros de rede (ECONNRESET, ETIMEDOUT, etc.)
 // ---------------------------------------------------------------------------
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
@@ -60,28 +63,19 @@ const RETRYABLE_CODES  = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EN
 
 async function comRetry(fn, { tentativas = 4, baseDelayMs = 1_000 } = {}) {
     let ultimoErro;
-
     for (let tentativa = 0; tentativa < tentativas; tentativa++) {
         try {
             return await fn();
         } catch (err) {
             ultimoErro = err;
-
             const status = err.response?.status;
             const code   = err.code;
-            const deveRetry =
-                RETRYABLE_STATUS.has(status) || RETRYABLE_CODES.has(code);
-
-            if (!deveRetry || tentativa === tentativas - 1) {
-                throw err;
-            }
-
-            // Respeita Retry-After se a API mandar
+            const deveRetry = RETRYABLE_STATUS.has(status) || RETRYABLE_CODES.has(code);
+            if (!deveRetry || tentativa === tentativas - 1) throw err;
             const retryAfter = err.response?.headers?.["retry-after"];
             const delayMs = retryAfter
                 ? Number(retryAfter) * 1_000
                 : baseDelayMs * 2 ** tentativa + Math.random() * 500;
-
             console.warn(
                 `[retry] tentativa ${tentativa + 1}/${tentativas} após ${Math.round(delayMs)}ms` +
                 ` (status=${status ?? code})`
@@ -89,7 +83,6 @@ async function comRetry(fn, { tentativas = 4, baseDelayMs = 1_000 } = {}) {
             await sleep(delayMs);
         }
     }
-
     throw ultimoErro;
 }
 
@@ -98,7 +91,7 @@ function sleep(ms) {
 }
 
 // ---------------------------------------------------------------------------
-// Mongoose / Schema
+// Mongoose / Schemas
 // ---------------------------------------------------------------------------
 
 const UsuarioSchema = new mongoose.Schema({
@@ -108,20 +101,100 @@ const UsuarioSchema = new mongoose.Schema({
     senha: { type: String, required: true }
 });
 
-const Usuario = mongoose.model(
-    "usuarios",
-    UsuarioSchema,
-    USUARIOS_COLLECTION
-);
+const Usuario = mongoose.model("usuarios", UsuarioSchema, USUARIOS_COLLECTION);
+
+// Admin do bot — persiste no Mongo para sobreviver a restarts
+const AdminBotSchema = new mongoose.Schema({
+    whatsappId: { type: String, required: true, unique: true },
+    adicionadoPor: { type: String, required: true },
+    adicionadoEm: { type: Date, default: Date.now }
+});
+
+const AdminBot = mongoose.model("admins_bot", AdminBotSchema, "admins_bot");
 
 // ---------------------------------------------------------------------------
-// Cache em memória: tokens de autenticação e salas
-//
-// Estrutura tokenCache:
-//   Map<userId, { authToken, nick, expiresAt }>
-//
-// Estrutura salasCache:
-//   Map<userId, { salas, expiresAt }>
+// Gestão de admins
+// ---------------------------------------------------------------------------
+
+// Cache em memória dos admins (sincronizado com Mongo na inicialização)
+let adminsCache = new Set();
+
+async function carregarAdmins() {
+    const admins = await AdminBot.find({}, { whatsappId: 1 }).lean();
+    adminsCache = new Set(admins.map((a) => a.whatsappId));
+    console.log(`Admins carregados do Mongo: ${adminsCache.size}`);
+}
+
+async function adicionarAdmin(whatsappId, adicionadoPor) {
+    await AdminBot.updateOne(
+        { whatsappId },
+        { whatsappId, adicionadoPor, adicionadoEm: new Date() },
+        { upsert: true }
+    );
+    adminsCache.add(whatsappId);
+}
+
+async function removerAdmin(whatsappId) {
+    await AdminBot.deleteOne({ whatsappId });
+    adminsCache.delete(whatsappId);
+}
+
+async function listarAdmins() {
+    return AdminBot.find({}).lean();
+}
+
+/**
+ * Normaliza qualquer formato de ID do WhatsApp para só os dígitos do número.
+ * Ex: "5511999999999@c.us" → "5511999999999"
+ *     "162247355711521@lid" → "162247355711521"
+ */
+function normalizarWhatsappId(id) {
+    if (!id) return "";
+    return String(id).split("@")[0].split(":")[0].replace(/\D/g, "");
+}
+
+/**
+ * Verifica se um ID (qualquer formato) bate com algum ID da lista de admins/liberados.
+ * Compara tanto por string exata quanto por número normalizado.
+ */
+function idEhAdmin(id) {
+    if (!id) return false;
+    if (LIBERADOS_ENV.has(id) || adminsCache.has(id)) return true;
+
+    const normalizado = normalizarWhatsappId(id);
+    for (const admin of [...LIBERADOS_ENV, ...adminsCache]) {
+        if (normalizarWhatsappId(admin) === normalizado) return true;
+    }
+    return false;
+}
+
+function idEhDono(id) {
+    if (!id) return false;
+    if (id === DONO_ID) return true;
+    return normalizarWhatsappId(id) === normalizarWhatsappId(DONO_ID);
+}
+
+/**
+ * Extrai o ID do WhatsApp de uma menção (@número) ou de um número digitado.
+ * Retorna o ID no formato "número@c.us".
+ */
+function resolverAlvo(texto, mentionedIds) {
+    // Se veio como menção (@número), usa o ID já resolvido pelo whatsapp-web.js
+    if (mentionedIds && mentionedIds.length > 0) {
+        return mentionedIds[0];
+    }
+
+    // Número digitado diretamente — remove tudo que não for dígito
+    const numero = texto.replace(/\D/g, "");
+    if (numero.length >= 10) {
+        return `${numero}@c.us`;
+    }
+
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Cache em memória: tokens e salas
 // ---------------------------------------------------------------------------
 
 const tokenCache = new Map();
@@ -140,7 +213,7 @@ function salasVálidas(entrada) {
 }
 
 // ---------------------------------------------------------------------------
-// API calls (sem cache — cache é feito na camada acima)
+// API calls
 // ---------------------------------------------------------------------------
 
 async function fazerLogin(user, senha) {
@@ -170,8 +243,7 @@ async function obterAuth(token) {
                     Accept: "application/json",
                     Origin: "https://saladofuturo.educacao.sp.gov.br",
                     Referer: "https://saladofuturo.educacao.sp.gov.br/",
-                    "User-Agent":
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
                     "x-api-platform": "webclient",
                     "x-api-realm": "edusp"
                 }
@@ -187,8 +259,7 @@ function criarHeaders(authToken) {
         Accept: "application/json",
         Origin: "https://saladofuturo.educacao.sp.gov.br",
         Referer: "https://saladofuturo.educacao.sp.gov.br/",
-        "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
         "x-api-key": authToken
     };
 }
@@ -207,10 +278,6 @@ async function obterSalasRemoto(authToken) {
 // Camada de cache
 // ---------------------------------------------------------------------------
 
-/**
- * Retorna { authToken, nick } usando cache quando possível.
- * Renova automaticamente se o token estiver próximo de expirar.
- */
 async function obterAuthComCache(usuario) {
     const key = tokenCacheKey(usuario);
     const cached = tokenCache.get(key);
@@ -219,49 +286,32 @@ async function obterAuthComCache(usuario) {
         return { authToken: cached.authToken, nick: cached.nick };
     }
 
-    // Login + troca de token
     const loginToken = await fazerLogin(usuario.user, usuario.senha);
     const auth = await obterAuth(loginToken);
 
-    // Tenta extrair expiração do JWT (campo exp em segundos)
-    let expiresAt = Date.now() + 60 * 60 * 1_000; // fallback: 1 hora
+    let expiresAt = Date.now() + 60 * 60 * 1_000;
     try {
         const payload = JSON.parse(
             Buffer.from(auth.auth_token.split(".")[1], "base64").toString()
         );
-        if (payload.exp) {
-            expiresAt = payload.exp * 1_000;
-        }
-    } catch {
-        // JWT não decodificável — usa fallback
-    }
+        if (payload.exp) expiresAt = payload.exp * 1_000;
+    } catch { /* JWT não decodificável */ }
 
-    tokenCache.set(key, {
-        authToken: auth.auth_token,
-        nick: auth.nick,
-        expiresAt
-    });
-
+    tokenCache.set(key, { authToken: auth.auth_token, nick: auth.nick, expiresAt });
     return { authToken: auth.auth_token, nick: auth.nick };
 }
 
-/**
- * Retorna salas usando cache quando possível.
- */
 async function obterSalasComCache(usuario, authToken) {
     const key = tokenCacheKey(usuario);
     const cached = salasCache.get(key);
 
-    if (salasVálidas(cached)) {
-        return cached.salas;
-    }
+    if (salasVálidas(cached)) return cached.salas;
 
     const salas = await obterSalasRemoto(authToken);
     salasCache.set(key, { salas, expiresAt: Date.now() + SALAS_CACHE_TTL_MS });
     return salas;
 }
 
-// Limpa caches de um usuário (útil em caso de 401 durante a coleta de tarefas)
 function invalidarCache(usuario) {
     const key = tokenCacheKey(usuario);
     tokenCache.delete(key);
@@ -288,7 +338,6 @@ function gerarUrlTarefas(salas, nickname, expiradas = false) {
     for (const room of salas.rooms || []) {
         params.append("publication_target", room.name);
         params.append("publication_target", `${room.name}:${nickname}`);
-
         for (const category of room.group_categories || []) {
             params.append("publication_target", category.id.toString());
         }
@@ -307,15 +356,10 @@ async function obterTarefas(salas, nickname, authToken, expiradas = false) {
 
 function obterNomeTarefa(tarefa) {
     return (
-        tarefa.title ||
-        tarefa.name ||
-        tarefa.nome ||
-        tarefa.task_title ||
-        tarefa.activity_title ||
-        tarefa.publication_title ||
-        tarefa.statement_title ||
-        tarefa.id ||
-        "Sem nome"
+        tarefa.title || tarefa.name || tarefa.nome ||
+        tarefa.task_title || tarefa.activity_title ||
+        tarefa.publication_title || tarefa.statement_title ||
+        tarefa.id || "Sem nome"
     );
 }
 
@@ -324,12 +368,9 @@ function resumirTarefas(tarefas) {
         id: tarefa.id || tarefa.task_id || tarefa.publication_id || tarefa._id,
         nome: obterNomeTarefa(tarefa),
         prazo:
-            tarefa.expire_at ||
-            tarefa.expired_at ||
-            tarefa.due_date ||
-            tarefa.deadline ||
-            tarefa.end_date ||
-            tarefa.apply_moment?.end_at
+            tarefa.expire_at || tarefa.expired_at ||
+            tarefa.due_date  || tarefa.deadline   ||
+            tarefa.end_date  || tarefa.apply_moment?.end_at
     }));
 }
 
@@ -338,38 +379,24 @@ function resumirTarefas(tarefas) {
 // ---------------------------------------------------------------------------
 
 function detalhesErro(err) {
-    if (err.response) {
-        return { status: err.response.status, body: err.response.data };
-    }
+    if (err.response) return { status: err.response.status, body: err.response.data };
     return { message: err.message };
 }
 
 async function processarUsuario(usuario) {
     const identificador = usuario.nome || usuario.user;
-
     try {
-        // 1. Auth com cache (faz login só se necessário)
         const { authToken, nick } = await obterAuthComCache(usuario);
-
-        // 2. Salas com cache (reusa por até 30 min)
         const salas = await obterSalasComCache(usuario, authToken);
-
-        // 3. Tarefas sequenciais — menos pico na API
         const pendentes = await obterTarefas(salas, nick, authToken, false);
         const expiradas = await obterTarefas(salas, nick, authToken, true);
-
         const pendentesResumo = resumirTarefas(pendentes);
         const expiradasResumo = resumirTarefas(expiradas);
 
         return {
             ok: true,
             linha: `${identificador}\nPENDENTES: ${pendentes.length}\nEXPIRADAS: ${expiradas.length}`,
-            usuario: {
-                id: usuario._id,
-                nome: usuario.nome,
-                email: usuario.email,
-                user: usuario.user
-            },
+            usuario: { id: usuario._id, nome: usuario.nome, email: usuario.email, user: usuario.user },
             nick,
             salas: salas.rooms?.length || 0,
             pendentesResumo,
@@ -379,24 +406,13 @@ async function processarUsuario(usuario) {
             totais: { pendentes: pendentes.length, expiradas: expiradas.length }
         };
     } catch (err) {
-        // Se 401, invalida cache para que na próxima tentativa ele relogue
-        if (err.response?.status === 401) {
-            invalidarCache(usuario);
-        }
-
+        if (err.response?.status === 401) invalidarCache(usuario);
         const erro = detalhesErro(err);
         console.error(`ERRO: ${identificador}`, JSON.stringify(erro));
-        console.error("");
-
         return {
             ok: false,
             linha: `${identificador}\nPENDENTES: -\nEXPIRADAS: -\nERRO`,
-            usuario: {
-                id: usuario._id,
-                nome: usuario.nome,
-                email: usuario.email,
-                user: usuario.user
-            },
+            usuario: { id: usuario._id, nome: usuario.nome, email: usuario.email, user: usuario.user },
             erro
         };
     }
@@ -409,7 +425,6 @@ async function processarUsuario(usuario) {
 async function executarComConcorrencia(items, limite, mapper) {
     const results = new Array(items.length);
     let proximo = 0;
-
     const workers = Array.from(
         { length: Math.min(limite, items.length) },
         async () => {
@@ -419,7 +434,6 @@ async function executarComConcorrencia(items, limite, mapper) {
             }
         }
     );
-
     await Promise.all(workers);
     return results;
 }
@@ -431,12 +445,8 @@ async function executarComConcorrencia(items, limite, mapper) {
 async function salvarResultado(resultados) {
     const outputDir = path.resolve(__dirname, "..", "output");
     await fs.mkdir(outputDir, { recursive: true });
-
-    const fileName = `tarefas-${new Date()
-        .toISOString()
-        .replace(/[:.]/g, "-")}.json`;
+    const fileName = `tarefas-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
     const filePath = path.join(outputDir, fileName);
-
     await fs.writeFile(filePath, JSON.stringify(resultados, null, 2), "utf8");
     return filePath;
 }
@@ -446,7 +456,6 @@ async function buscarUsuarios() {
         { user: { $exists: true, $ne: "" }, senha: { $exists: true, $ne: "" } },
         { nome: 1, email: 1, user: 1, senha: 1 }
     ).lean();
-
     return usuarios.sort((a, b) => {
         const nomeA = a.nome || a.user;
         const nomeB = b.nome || b.user;
@@ -478,7 +487,7 @@ async function gerarRelatorioTarefas() {
     const resumo = resultados.reduce(
         (acc, item) => {
             if (!item.ok) { acc.erros += 1; return acc; }
-            acc.sucesso  += 1;
+            acc.sucesso   += 1;
             acc.pendentes += item.totais.pendentes;
             acc.expiradas += item.totais.expiradas;
             return acc;
@@ -493,59 +502,7 @@ async function gerarRelatorioTarefas() {
     });
 
     console.log(`Arquivo salvo em: ${filePath}`);
-
     return { mensagem: montarMensagem(resultados), resumo, filePath };
-}
-
-// ---------------------------------------------------------------------------
-// WhatsApp – helpers de autorização
-// ---------------------------------------------------------------------------
-
-function normalizarWhatsappId(id) {
-    if (!id) return "";
-    return String(id).split("@")[0].split(":")[0].replace(/\D/g, "");
-}
-
-function idsDoParticipante(participante) {
-    return [
-        participante?.id?._serialized,
-        participante?.id?.user,
-        participante?.id?.server
-            ? `${participante.id.user}@${participante.id.server}`
-            : undefined
-    ].filter(Boolean);
-}
-
-function remetentePodeUsarComando(chat, message, comando) {
-    if (!chat.isGroup) return false;
-
-    const remetente = message.author || message.from;
-    const remetenteNormalizado = normalizarWhatsappId(remetente);
-    const remetenteLiberado = REMETENTES_LIBERADOS.has(remetente);
-
-    const participante = chat.participants.find((item) =>
-        idsDoParticipante(item).some(
-            (id) =>
-                id === remetente ||
-                normalizarWhatsappId(id) === remetenteNormalizado
-        )
-    );
-
-    console.log(
-        `Comando ${comando}:`,
-        JSON.stringify({
-            remetente,
-            remetenteNormalizado,
-            remetenteLiberado,
-            participanteEncontrado: Boolean(participante),
-            isAdmin: Boolean(participante?.isAdmin),
-            isSuperAdmin: Boolean(participante?.isSuperAdmin)
-        })
-    );
-
-    return Boolean(
-        remetenteLiberado || participante?.isAdmin || participante?.isSuperAdmin
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -559,9 +516,6 @@ async function gerarStatusBot(gerandoRelatorio) {
         senha: { $exists: true, $ne: "" }
     });
 
-    const tokensCached = tokenCache.size;
-    const salasCached  = salasCache.size;
-
     return [
         "STATUS DO BOT",
         "",
@@ -572,10 +526,163 @@ async function gerarStatusBot(gerandoRelatorio) {
         `TOTAL NA COLLECTION: ${totalNaCollection}`,
         `USUARIOS COM LOGIN: ${usuariosComCredenciais}`,
         `CONCORRENCIA: ${CONCURRENCY}`,
-        `TOKENS EM CACHE: ${tokensCached}`,
-        `SALAS EM CACHE: ${salasCached}`,
+        `TOKENS EM CACHE: ${tokenCache.size}`,
+        `SALAS EM CACHE: ${salasCache.size}`,
+        `ADMINS BOT: ${adminsCache.size}`,
         `RELATORIO: ${gerandoRelatorio ? "gerando agora" : "livre"}`
     ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Handlers de mensagem
+// ---------------------------------------------------------------------------
+
+function idsDoParticipante(participante) {
+    return [
+        participante?.id?._serialized,
+        participante?.id?.user,
+        participante?.id?.server
+            ? `${participante.id.user}@${participante.id.server}`
+            : undefined
+    ].filter(Boolean);
+}
+
+function remetentePodeUsarComandoEmGrupo(chat, message, comando) {
+    const remetente = message.author || message.from;
+    const remetenteNormalizado = normalizarWhatsappId(remetente);
+
+    if (idEhAdmin(remetente)) return true;
+
+    const participante = chat.participants.find((item) =>
+        idsDoParticipante(item).some(
+            (id) => id === remetente || normalizarWhatsappId(id) === remetenteNormalizado
+        )
+    );
+
+    console.log(
+        `Comando ${comando}:`,
+        JSON.stringify({
+            remetente,
+            remetenteNormalizado,
+            ehAdmin: idEhAdmin(remetente),
+            participanteEncontrado: Boolean(participante),
+            isAdmin: Boolean(participante?.isAdmin),
+            isSuperAdmin: Boolean(participante?.isSuperAdmin)
+        })
+    );
+
+    return Boolean(participante?.isAdmin || participante?.isSuperAdmin);
+}
+
+/**
+ * Processa /admin adicionar|remover|listar
+ * Só o dono pode executar.
+ */
+async function handleAdmin(message, chat, remetente) {
+    if (!idEhDono(remetente)) {
+        await message.reply("Apenas o dono do bot pode gerenciar admins.");
+        return;
+    }
+
+    const partes = message.body.trim().split(/\s+/);
+    // partes[0] = "/admin", partes[1] = subcomando, partes[2] = alvo opcional
+    const subcomando = (partes[1] || "").toLowerCase();
+
+    if (subcomando === "listar") {
+        const admins = await listarAdmins();
+        if (admins.length === 0) {
+            await message.reply("Nenhum admin cadastrado alem dos fixos.");
+            return;
+        }
+        const linhas = admins.map(
+            (a) => `• ${a.whatsappId}  (adicionado por ${a.adicionadoPor} em ${new Date(a.adicionadoEm).toLocaleDateString("pt-BR")})`
+        );
+        await message.reply(`*Admins do bot:*\n${linhas.join("\n")}`);
+        return;
+    }
+
+    if (subcomando === "adicionar" || subcomando === "remover") {
+        // Tenta resolver pelo número digitado (partes[2]) ou pela menção
+        const textoAlvo = partes[2] || "";
+        const mentionedIds = message.mentionedIds || [];
+        const alvoId = resolverAlvo(textoAlvo, mentionedIds);
+
+        if (!alvoId) {
+            await message.reply(
+                `Uso:\n/admin adicionar @pessoa\n/admin adicionar 5511999999999\n/admin remover @pessoa\n/admin listar`
+            );
+            return;
+        }
+
+        if (subcomando === "adicionar") {
+            await adicionarAdmin(alvoId, remetente);
+            await message.reply(`Admin adicionado: ${alvoId}`);
+        } else {
+            await removerAdmin(alvoId);
+            await message.reply(`Admin removido: ${alvoId}`);
+        }
+        return;
+    }
+
+    await message.reply(
+        `Uso:\n/admin adicionar @pessoa\n/admin adicionar 5511999999999\n/admin remover @pessoa\n/admin listar`
+    );
+}
+
+/**
+ * Processa /tarefas e /status — funciona em grupo e no privado.
+ */
+async function handleRelatorio(message, chat, remetente, gerandoRelatorio, setGerandoRelatorio) {
+    const comando = message.body.trim().toLowerCase();
+    const emGrupo = chat.isGroup;
+
+    // Verifica permissão
+    const temPermissao = emGrupo
+        ? remetentePodeUsarComandoEmGrupo(chat, message, comando)
+        : idEhAdmin(remetente);
+
+    if (!temPermissao) {
+        await message.reply(
+            emGrupo
+                ? `Apenas admins do grupo podem usar ${comando}.`
+                : `Voce nao tem permissao para usar ${comando} no privado.`
+        );
+        return;
+    }
+
+    if (comando === STATUS_COMMAND) {
+        try {
+            const status = await gerarStatusBot(gerandoRelatorio);
+            await message.reply(`\`\`\`\n${status}\n\`\`\``);
+        } catch (err) {
+            console.error("Falha ao gerar status:", detalhesErro(err));
+            await message.reply("Nao consegui buscar o status agora.");
+        }
+        return;
+    }
+
+    // /tarefas
+    if (gerandoRelatorio) {
+        await message.reply("Ja estou gerando um relatorio. Aguarde finalizar.");
+        return;
+    }
+
+    setGerandoRelatorio(true);
+    try {
+        await message.reply("Buscando tarefas....");
+        const { mensagem } = await gerarRelatorioTarefas();
+        // No privado responde direto; em grupo manda no chat para todos verem
+        if (emGrupo) {
+            await chat.sendMessage(mensagem);
+        } else {
+            await message.reply(mensagem);
+        }
+    } catch (err) {
+        console.error("Falha ao gerar relatorio:", detalhesErro(err));
+        await message.reply("Nao consegui buscar as tarefas agora.");
+    } finally {
+        setGerandoRelatorio(false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,12 +691,11 @@ async function gerarStatusBot(gerandoRelatorio) {
 
 async function iniciarWhatsapp() {
     if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1) {
-        throw new Error(
-            "CONCURRENCY precisa ser um numero inteiro maior que zero."
-        );
+        throw new Error("CONCURRENCY precisa ser um numero inteiro maior que zero.");
     }
 
     await mongoose.connect(MONGO_URI);
+    await carregarAdmins();
 
     const client = new Client({
         authStrategy: new LocalAuth({
@@ -607,71 +713,46 @@ async function iniciarWhatsapp() {
         }
     });
 
-    let gerandoRelatorio = false;
+    let _gerandoRelatorio = false;
+    const getGerandoRelatorio = () => _gerandoRelatorio;
+    const setGerandoRelatorio = (v) => { _gerandoRelatorio = v; };
 
     client.on("qr", async (qr) => {
-        const qrTerminal = await QRCode.toString(qr, {
-            type: "terminal",
-            small: true
-        });
+        const qrTerminal = await QRCode.toString(qr, { type: "terminal", small: true });
         console.log(qrTerminal);
         console.log("Escaneie o QR Code acima com o WhatsApp.");
     });
 
     client.on("ready", () => {
-        console.log(
-            "WhatsApp conectado. Aguardando /tarefas e /status em grupos."
-        );
+        console.log("WhatsApp conectado. Aguardando comandos em grupos e no privado.");
     });
 
     client.on("message", async (message) => {
-        const comando = message.body.trim().toLowerCase();
+        const corpo = message.body.trim();
+        const comandoLower = corpo.toLowerCase();
+        const remetente = message.from; // no privado é o número; em grupo é o chat id
 
-        if (![TAREFAS_COMMAND, STATUS_COMMAND].includes(comando)) return;
+        // Em grupos o remetente real é message.author
+        const autorReal = message.author || message.from;
 
         const chat = await message.getChat();
 
-        if (!chat.isGroup) {
-            await message.reply("Esse comando funciona apenas em grupos.");
+        // /admin — só no privado ou em grupo, mas só dono executa de qualquer lugar
+        if (comandoLower.startsWith(ADMIN_COMMAND)) {
+            await handleAdmin(message, chat, autorReal);
             return;
         }
 
-        if (!remetentePodeUsarComando(chat, message, comando)) {
-            await message.reply(
-                `Apenas admins do grupo podem usar ${comando}.`
+        // /tarefas e /status — grupo ou privado
+        if ([TAREFAS_COMMAND, STATUS_COMMAND].includes(comandoLower)) {
+            await handleRelatorio(
+                message,
+                chat,
+                autorReal,
+                getGerandoRelatorio(),
+                setGerandoRelatorio
             );
             return;
-        }
-
-        if (comando === STATUS_COMMAND) {
-            try {
-                const status = await gerarStatusBot(gerandoRelatorio);
-                await chat.sendMessage(`\`\`\`\n${status}\n\`\`\``);
-            } catch (err) {
-                console.error("Falha ao gerar status:", detalhesErro(err));
-                await message.reply("Nao consegui buscar o status agora.");
-            }
-            return;
-        }
-
-        if (gerandoRelatorio) {
-            await message.reply(
-                "Ja estou gerando um relatorio. Aguarde finalizar."
-            );
-            return;
-        }
-
-        gerandoRelatorio = true;
-
-        try {
-            await message.reply("Buscando tarefas....");
-            const { mensagem } = await gerarRelatorioTarefas();
-            await chat.sendMessage(mensagem);
-        } catch (err) {
-            console.error("Falha ao gerar relatorio:", detalhesErro(err));
-            await message.reply("Nao consegui buscar as tarefas agora.");
-        } finally {
-            gerandoRelatorio = false;
         }
     });
 
