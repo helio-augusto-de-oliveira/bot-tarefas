@@ -689,6 +689,48 @@ async function handleRelatorio(message, chat, remetente, gerandoRelatorio, setGe
 // Inicialização
 // ---------------------------------------------------------------------------
 
+/**
+ * Remove os arquivos de lock que o Chromium deixa no perfil.
+ * Quando o container reinicia o perfil fica no volume, mas o PID
+ * do processo anterior não existe mais — o Chromium recusa iniciar
+ * até esses arquivos serem removidos.
+ *
+ * Arquivos removidos:
+ *   SingletonLock, SingletonCookie, SingletonSocket
+ *   (buscados recursivamente dentro do diretório de auth)
+ */
+async function limparLocksBrowser(authDir) {
+    const nomes = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+
+    async function varrerDir(dir) {
+        let entries;
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+            return; // diretório não existe ainda — tudo bem
+        }
+
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                await varrerDir(fullPath);
+            } else if (nomes.includes(entry.name)) {
+                try {
+                    await fs.unlink(fullPath);
+                    console.log(`[browser-lock] removido: ${fullPath}`);
+                } catch (err) {
+                    // Se já sumiu por corrida, ignora
+                    if (err.code !== "ENOENT") {
+                        console.warn(`[browser-lock] nao conseguiu remover ${fullPath}:`, err.message);
+                    }
+                }
+            }
+        }
+    }
+
+    await varrerDir(path.resolve(authDir));
+}
+
 async function iniciarWhatsapp() {
     if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1) {
         throw new Error("CONCURRENCY precisa ser um numero inteiro maior que zero.");
@@ -696,6 +738,11 @@ async function iniciarWhatsapp() {
 
     await mongoose.connect(MONGO_URI);
     await carregarAdmins();
+
+    // Remove locks do Chromium que ficam presos quando o container reinicia.
+    // O perfil fica num volume persistente, mas o PID do container anterior
+    // não existe mais — sem limpar isso o Chromium recusa iniciar.
+    await limparLocksBrowser(WHATSAPP_AUTH_DIR);
 
     const client = new Client({
         authStrategy: new LocalAuth({
