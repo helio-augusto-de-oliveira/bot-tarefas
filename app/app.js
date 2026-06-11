@@ -630,6 +630,27 @@ async function handleAdmin(message, chat, remetente) {
 }
 
 /**
+ * Guarda a última mensagem de relatório enviada pelo bot por chat.
+ * Chave: chatId  →  Valor: objeto Message do whatsapp-web.js
+ * Usado para apagar a mensagem anterior quando um novo relatório chega com sucesso.
+ */
+const ultimaMensagemRelatorio = new Map();
+
+async function apagarUltimaMensagem(chatId) {
+    const msg = ultimaMensagemRelatorio.get(chatId);
+    if (!msg) return;
+
+    try {
+        await msg.delete(true); // true = apaga para todos
+        ultimaMensagemRelatorio.delete(chatId);
+    } catch (err) {
+        // Mensagem muito antiga (>2 min) ou sem permissão — ignora silenciosamente
+        console.warn(`[delete] nao conseguiu apagar mensagem anterior em ${chatId}:`, err.message);
+        ultimaMensagemRelatorio.delete(chatId);
+    }
+}
+
+/**
  * Processa /tarefas e /status — funciona em grupo e no privado.
  */
 async function handleRelatorio(message, chat, remetente, gerandoRelatorio, setGerandoRelatorio) {
@@ -671,11 +692,20 @@ async function handleRelatorio(message, chat, remetente, gerandoRelatorio, setGe
     try {
         await message.reply("Buscando tarefas....");
         const { mensagem } = await gerarRelatorioTarefas();
-        // No privado responde direto; em grupo manda no chat para todos verem
+
+        // Apaga o relatório anterior deste chat (se existir e ainda for possível)
+        await apagarUltimaMensagem(chat.id._serialized);
+
+        // Envia o novo relatório e guarda a referência para apagar na próxima vez
+        let msgEnviada;
         if (emGrupo) {
-            await chat.sendMessage(mensagem);
+            msgEnviada = await chat.sendMessage(mensagem);
         } else {
-            await message.reply(mensagem);
+            msgEnviada = await message.reply(mensagem);
+        }
+
+        if (msgEnviada) {
+            ultimaMensagemRelatorio.set(chat.id._serialized, msgEnviada);
         }
     } catch (err) {
         console.error("Falha ao gerar relatorio:", detalhesErro(err));
