@@ -36,7 +36,7 @@ const LIBERADOS_ENV = new Set(
 );
 
 // Quanto tempo antes do vencimento o token é renovado proativamente (ms)
-const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const TOKEN_REFRESH_BUFFER_MS = 30 * 60 * 1000;
 // TTL do cache de salas: 30 min
 const SALAS_CACHE_TTL_MS = 30 * 60 * 1000;
 
@@ -60,6 +60,9 @@ const api = axios.create({
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_CODES  = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "ENETUNREACH"]);
+
+
+console.log("nhonho 4.5")
 
 async function comRetry(fn, { tentativas = 4, baseDelayMs = 1_000 } = {}) {
     let ultimoErro;
