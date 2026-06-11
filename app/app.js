@@ -61,9 +61,6 @@ const api = axios.create({
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_CODES  = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "ENETUNREACH"]);
 
-
-console.log("nhonho 4.5")
-
 async function comRetry(fn, { tentativas = 4, baseDelayMs = 1_000 } = {}) {
     let ultimoErro;
     for (let tentativa = 0; tentativa < tentativas; tentativa++) {
@@ -357,6 +354,54 @@ async function obterTarefas(salas, nickname, authToken, expiradas = false) {
     return Array.isArray(data) ? data : [];
 }
 
+/**
+ * Busca tarefas devolvidas pelo professor via /tms/answer?status=pending.
+ * Essas tarefas saem do /task/todo apos entrega e so aparecem aqui
+ * quando o professor devolve para o aluno corrigir/reenviar.
+ */
+async function obterTarefasDevolvidas(salas, nickname, authToken) {
+    const params = new URLSearchParams({
+        nick: nickname,
+        limit: "100",
+        offset: "0",
+        status: "pending",
+        task_is_exam: "false",
+        task_is_essay: "false",
+        order: "asc",
+        order_by: "task_id",
+        with_apply_moment: "true"
+    });
+
+    // campos necessarios
+    for (const f of ["id","nick","status","task_id","delivered_at","publication_target",
+                     "task.title","task.expire_at","task.is_exam","task.is_essay"]) {
+        params.append("fields", f);
+    }
+
+    for (const room of salas.rooms || []) {
+        params.append("publication_target", room.name);
+        params.append("publication_target", `${room.name}:${nickname}`);
+        for (const category of room.group_categories || []) {
+            params.append("publication_target", category.id.toString());
+        }
+    }
+
+    const url = `https://edusp-api.ip.tv/tms/answer?${params.toString()}`;
+    const { data } = await comRetry(() =>
+        api.get(url, { headers: criarHeaders(authToken) })
+    );
+
+    const items = Array.isArray(data) ? data : (data?.data ?? []);
+
+    // Normaliza para o mesmo formato do /task/todo
+    return items.map((item) => ({
+        ...item,
+        _devolvida: true,
+        title: item.task?.title || item.title,
+        expire_at: item.task?.expire_at || item.expire_at || item.apply_moment?.end_at
+    }));
+}
+
 function obterNomeTarefa(tarefa) {
     return (
         tarefa.title || tarefa.name || tarefa.nome ||
@@ -370,6 +415,7 @@ function resumirTarefas(tarefas) {
     return tarefas.map((tarefa) => ({
         id: tarefa.id || tarefa.task_id || tarefa.publication_id || tarefa._id,
         nome: obterNomeTarefa(tarefa),
+        devolvida: tarefa._devolvida === true,
         prazo:
             tarefa.expire_at || tarefa.expired_at ||
             tarefa.due_date  || tarefa.deadline   ||
@@ -391,22 +437,32 @@ async function processarUsuario(usuario) {
     try {
         const { authToken, nick } = await obterAuthComCache(usuario);
         const salas = await obterSalasComCache(usuario, authToken);
-        const pendentes = await obterTarefas(salas, nick, authToken, false);
-        const expiradas = await obterTarefas(salas, nick, authToken, true);
-        const pendentesResumo = resumirTarefas(pendentes);
+
+        const pendentes  = await obterTarefas(salas, nick, authToken, false);
+        const expiradas  = await obterTarefas(salas, nick, authToken, true);
+        const devolvidas = await obterTarefasDevolvidas(salas, nick, authToken);
+
+        // Mescla devolvidas nas pendentes, evitando duplicatas por task_id
+        const idsPendentes = new Set(pendentes.map((t) => String(t.id || t.task_id)));
+        const devolvidasNovas = devolvidas.filter(
+            (t) => !idsPendentes.has(String(t.task_id || t.id))
+        );
+        const pendentesMescladas = [...pendentes, ...devolvidasNovas];
+
+        const pendentesResumo = resumirTarefas(pendentesMescladas);
         const expiradasResumo = resumirTarefas(expiradas);
 
         return {
             ok: true,
-            linha: `${identificador}\nPENDENTES: ${pendentes.length}\nEXPIRADAS: ${expiradas.length}`,
+            linha: `${identificador}\nPENDENTES: ${pendentesMescladas.length} (${devolvidasNovas.length} devolvidas)\nEXPIRADAS: ${expiradas.length}`,
             usuario: { id: usuario._id, nome: usuario.nome, email: usuario.email, user: usuario.user },
             nick,
             salas: salas.rooms?.length || 0,
             pendentesResumo,
             expiradasResumo,
-            pendentes,
+            pendentes: pendentesMescladas,
             expiradas,
-            totais: { pendentes: pendentes.length, expiradas: expiradas.length }
+            totais: { pendentes: pendentesMescladas.length, devolvidas: devolvidasNovas.length, expiradas: expiradas.length }
         };
     } catch (err) {
         if (err.response?.status === 401) invalidarCache(usuario);
